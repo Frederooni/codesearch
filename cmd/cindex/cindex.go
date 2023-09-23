@@ -42,7 +42,7 @@ Options:
   -logskip     print why a file was skipped from indexing
   -no-follow-symlinks
                do not follow symlinked files and directories
-  -maxFileLen BYTES
+  -maxfilelen BYTES
                skip indexing a file if longer than this size in bytes (Default: %v)
   -maxlinelen BYTES
                skip indexing a file if it has a line longer than this size in bytes (Default: %v)
