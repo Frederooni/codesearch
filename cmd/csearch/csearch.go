@@ -11,7 +11,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"runtime/pprof"
+	"strings"
 
 	"github.com/junkblocker/codesearch/index"
 	"github.com/junkblocker/codesearch/regexp"
@@ -35,6 +37,8 @@ Options:
                (Not allowed with -c or -l modes)
   -n           print each output line preceded by its relative line number in
                the file, starting at 1
+  -relative    search only files under the current directory and print their
+               paths relative to it, like git grep
   -indexpath FILE
                use specified FILE as the index path. Overrides $CSEARCHINDEX.
   -verbose     print extra information
@@ -58,7 +62,8 @@ the index. If no index exists, this command creates one.  If an index already
 exists, cindex overwrites it.  Run cindex -help for more.
 
 csearch uses the index stored in $CSEARCHINDEX or, if that variable is unset or
-empty, $HOME/.csearchindex.
+empty, $HOME/.csearchindex. If the index was built with cindex -relative, its
+paths are taken as relative to the directory that contains the index.
 `
 
 func usage() {
@@ -75,9 +80,24 @@ var (
 	indexPath       = flag.String("indexpath", "", "specifies index path")
 	maxCount        = flag.Int64("m", 0, "specified maximum number of search results")
 	maxCountPerFile = flag.Int64("M", 0, "specified maximum number of search results per file")
+	relativeFlag    = flag.Bool("relative", false, "search only files under the current directory and print paths relative to it")
 
 	matches bool
 )
+
+// underDir returns name relative to the first of dirs that contains it, or
+// false if none does.
+func underDir(dirs []string, name string) (string, bool) {
+	for _, dir := range dirs {
+		if !strings.HasSuffix(dir, string(filepath.Separator)) {
+			dir += string(filepath.Separator)
+		}
+		if strings.HasPrefix(name, dir) {
+			return name[len(dir):], true
+		}
+	}
+	return "", false
+}
 
 func Main() {
 	g := regexp.Grep{
@@ -134,6 +154,19 @@ func Main() {
 
 	ix := index.Open(index.File())
 	ix.Verbose = *verboseFlag
+	var root string
+	if ix.Relative() {
+		root, err = filepath.Abs(filepath.Dir(index.File()))
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+	fileName := func(fileid uint32) string {
+		if root == "" {
+			return ix.Name(fileid)
+		}
+		return filepath.Join(root, ix.Name(fileid))
+	}
 	var post []uint32
 	if *bruteFlag {
 		post = ix.PostingQuery(&index.Query{Op: index.QAll})
@@ -148,7 +181,7 @@ func Main() {
 		fnames := make([]uint32, 0, len(post))
 
 		for _, fileid := range post {
-			name := ix.Name(fileid)
+			name := fileName(fileid)
 			if fre.MatchString(name, true, true) < 0 {
 				continue
 			}
@@ -161,10 +194,30 @@ func Main() {
 		post = fnames
 	}
 
+	var cwds []string
+	if *relativeFlag {
+		cwd, err := os.Getwd()
+		if err != nil {
+			log.Fatal(err)
+		}
+		cwds = append(cwds, cwd)
+		// The index may spell the current directory with symlinks resolved.
+		if real, err := filepath.EvalSymlinks(cwd); err == nil && real != cwd {
+			cwds = append(cwds, real)
+		}
+	}
+
 	g.LimitPrintCount(*maxCount, *maxCountPerFile)
 
 	for _, fileid := range post {
-		name := ix.Name(fileid)
+		name := fileName(fileid)
+		if *relativeFlag {
+			rel, ok := underDir(cwds, name)
+			if !ok {
+				continue
+			}
+			name = rel
+		}
 		g.File(name)
 		// short circuit here too
 		if g.Done {

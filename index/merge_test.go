@@ -102,3 +102,95 @@ func TestMerge(t *testing.T) {
 	check(ix3, "now", 3, 4, 6)
 	check(ix3, "pot", 4, 5, 7)
 }
+
+func TestMergeRelative(t *testing.T) {
+	tests := []struct {
+		name           string
+		paths1, paths2 []string
+		files1, files2 map[string]string
+		wantNames      []string
+		wantPosts      map[string][]uint32
+	}{
+		{
+			name:   "new index covers root",
+			paths1: []string{"a", "b"},
+			files1: map[string]string{
+				"a/x": "hello world",
+				"b/y": "now is the time",
+			},
+			paths2: []string{"."},
+			files2: map[string]string{
+				"-z":  "potatoes now",
+				"a/x": "goodbye world",
+				"c":   "world wide",
+			},
+			wantNames: []string{"-z", "a/x", "c"},
+			wantPosts: map[string][]uint32{
+				"hel": {},
+				"now": {0},
+				"wor": {1, 2},
+			},
+		},
+		{
+			name:   "old index covers root",
+			paths1: []string{"."},
+			files1: map[string]string{
+				"-z":  "potatoes now",
+				"a/x": "hello world",
+				"b/y": "now is the time",
+				"c":   "world wide",
+			},
+			paths2: []string{"b"},
+			files2: map[string]string{
+				"b/w": "give me all the potatoes",
+				"b/y": "for all good men",
+			},
+			wantNames: []string{"-z", "a/x", "b/w", "b/y", "c"},
+			wantPosts: map[string][]uint32{
+				"all": {2, 3},
+				"now": {0},
+				"pot": {0, 2},
+				"wor": {1, 4},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f1, _ := ioutil.TempFile("", "index-test")
+			f2, _ := ioutil.TempFile("", "index-test")
+			f3, _ := ioutil.TempFile("", "index-test")
+			defer os.Remove(f1.Name())
+			defer os.Remove(f2.Name())
+			defer os.Remove(f3.Name())
+
+			buildIndex(t, f1.Name(), tt.paths1, tt.files1)
+			buildIndex(t, f2.Name(), tt.paths2, tt.files2)
+			Merge(f3.Name(), f1.Name(), f2.Name())
+
+			ix := Open(f3.Name())
+			defer ix.Close()
+
+			if !ix.Relative() {
+				t.Errorf("Relative() = false, want true")
+			}
+			if p := ix.Paths(); len(p) != 1 || p[0] != "." {
+				t.Errorf("Paths() = %q, want [\".\"]", p)
+			}
+			if ix.numName != len(tt.wantNames) {
+				t.Errorf("%d names, want %d", ix.numName, len(tt.wantNames))
+			}
+			for i, want := range tt.wantNames {
+				if i < ix.numName {
+					if n := ix.Name(uint32(i)); n != want {
+						t.Errorf("Name(%d) = %s, want %s", i, n, want)
+					}
+				}
+			}
+			for trig, want := range tt.wantPosts {
+				if l := ix.PostingList(tri(trig[0], trig[1], trig[2])); !equalList(l, want) {
+					t.Errorf("PostingList(%s) = %v, want %v", trig, l, want)
+				}
+			}
+		})
+	}
+}

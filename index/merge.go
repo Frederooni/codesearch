@@ -64,14 +64,17 @@ func Merge(dst, src1, src2 string) {
 	var i1, i2, new uint32
 	var map1, map2 []idrange
 	for _, path := range paths2 {
+		// "." is the root of a relative index and covers every name.
+		all := path == "."
+
 		// Determine range shadowed by this path.
 		old := i1
-		for i1 < uint32(ix1.numName) && ix1.Name(i1) < path {
+		for !all && i1 < uint32(ix1.numName) && ix1.Name(i1) < path {
 			i1++
 		}
 		lo := i1
 		limit := path[:len(path)-1] + string(path[len(path)-1]+1)
-		for i1 < uint32(ix1.numName) && ix1.Name(i1) < limit {
+		for i1 < uint32(ix1.numName) && (all || ix1.Name(i1) < limit) {
 			i1++
 		}
 		hi := i1
@@ -85,11 +88,11 @@ func Merge(dst, src1, src2 string) {
 		// Determine range defined by this path.
 		// Because we are iterating over the ix2 paths,
 		// there can't be gaps, so it must start at i2.
-		if i2 < uint32(ix2.numName) && ix2.Name(i2) < path {
+		if !all && i2 < uint32(ix2.numName) && ix2.Name(i2) < path {
 			panic("merge: inconsistent index")
 		}
 		lo = i2
-		for i2 < uint32(ix2.numName) && ix2.Name(i2) < limit {
+		for i2 < uint32(ix2.numName) && (all || ix2.Name(i2) < limit) {
 			i2++
 		}
 		hi = i2
@@ -113,6 +116,10 @@ func Merge(dst, src1, src2 string) {
 
 	// Merged list of paths.
 	pathData := ix3.offset()
+	if len(paths1) > 0 && paths1[0] == "." || len(paths2) > 0 && paths2[0] == "." {
+		// "." covers every other path of a relative index.
+		paths1, paths2 = []string{"."}, nil
+	}
 	mi1 := 0
 	mi2 := 0
 	last := "\x00" // not a prefix of anything

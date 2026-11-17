@@ -140,6 +140,13 @@ func (ix *Index) uvarint(off uint32) uint32 {
 	return uint32(v)
 }
 
+// Relative reports whether the index stores its paths relative to the
+// directory that contains the index file.
+func (ix *Index) Relative() bool {
+	s := ix.str(ix.pathData)
+	return len(s) > 0 && !filepath.IsAbs(string(s))
+}
+
 // Paths returns the list of indexed paths.
 func (ix *Index) Paths() []string {
 	off := ix.pathData

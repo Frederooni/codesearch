@@ -37,6 +37,10 @@ Options:
   -reset       discard existing index
   -indexpath FILE
                use specified FILE as the index path. Overrides $CSEARCHINDEX.
+  -relative    store paths relative to the directory that contains the index,
+               so the index can be moved along with the tree. Every path must
+               be inside that directory. An index built this way stays
+               relative when cindex updates it.
   -cpuprofile FILE
                write CPU profile to FILE
   -logskip     print why a file was skipped from indexing
@@ -96,6 +100,7 @@ var (
 	verboseFlag          = flag.Bool("verbose", false, "print extra information")
 	cpuProfile           = flag.String("cpuprofile", "", "write cpu profile to this file")
 	indexPath            = flag.String("indexpath", "", "specifies index path")
+	relativeFlag         = flag.Bool("relative", false, "store paths relative to the directory that contains the index")
 	logSkipFlag          = flag.Bool("logskip", false, "print why a file was skipped from indexing")
 	noFollowSymlinksFlag = flag.Bool("no-follow-symlinks", false, "do not follow symlinked files and directories")
 	exclude              = flag.String("exclude", "", "path to file containing a list of file patterns to exclude from indexing")
@@ -221,6 +226,33 @@ func walk(arg string, symlinkFrom string, out chan string, logskip bool) {
 	})
 }
 
+// relativeName returns path relative to root, or false if path is outside
+// root.
+func relativeName(root, path string) (string, bool) {
+	rel, err := filepath.Rel(root, path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return rel, true
+}
+
+// insideRoot returns path spelled as a path under root, or an error if path
+// is outside root. Symlinks are followed only when path reaches root by a
+// different spelling.
+func insideRoot(root, path string) (string, error) {
+	if _, ok := relativeName(root, path); ok {
+		return path, nil
+	}
+	realRoot, err1 := filepath.EvalSymlinks(root)
+	realPath, err2 := filepath.EvalSymlinks(path)
+	if err1 == nil && err2 == nil {
+		if rel, ok := relativeName(realRoot, realPath); ok {
+			return filepath.Join(root, rel), nil
+		}
+	}
+	return "", fmt.Errorf("%s: outside %s; -relative paths must be inside the directory that contains the index", path, root)
+}
+
 func main() {
 	flag.Usage = usage
 	flag.Parse()
@@ -307,9 +339,34 @@ func main() {
 		args = append(args, strings.Split(string(data), "\n")...)
 	}
 
+	master := index.File()
+	relative := *relativeFlag
+	if !*resetFlag {
+		if stat, err := os.Stat(master); err == nil && stat.Mode().IsRegular() {
+			ix := index.Open(master)
+			if ix.Relative() {
+				relative = true
+			} else if relative && len(ix.Paths()) > 0 {
+				log.Fatalf("%s holds absolute paths; add -reset to rebuild it with -relative", master)
+			}
+			ix.Close()
+		}
+	}
+	var root string
+	if relative {
+		r, err := filepath.Abs(filepath.Dir(master))
+		if err != nil {
+			log.Fatal(err)
+		}
+		root = r
+	}
+
 	if len(args) == 0 {
-		ix := index.Open(index.File())
+		ix := index.Open(master)
 		for _, arg := range ix.Paths() {
+			if relative {
+				arg = filepath.Join(root, arg)
+			}
 			args = append(args, arg)
 		}
 		ix.Close()
@@ -324,6 +381,11 @@ func main() {
 			args[i] = ""
 			continue
 		}
+		if relative {
+			if a, err = insideRoot(root, a); err != nil {
+				log.Fatal(err)
+			}
+		}
 		args[i] = a
 	}
 	sort.Strings(args)
@@ -332,7 +394,18 @@ func main() {
 		args = args[1:]
 	}
 
-	master := index.File()
+	paths := args
+	if relative {
+		// Index merging requires "." to be the only path when present.
+		if len(args) > 0 && args[0] == root {
+			args = args[:1]
+		}
+		paths = make([]string, len(args))
+		for i, a := range args {
+			paths[i], _ = relativeName(root, a)
+		}
+	}
+
 	if stat, err := os.Stat(master); err != nil {
 		// Does not exist.
 		*resetFlag = true
@@ -355,19 +428,35 @@ func main() {
 	ix.MaxTextTrigrams = *maxTextTrigrams
 	ix.MaxInvalidUTF8Ratio = *maxInvalidUTF8Ratio
 	ix.MaxNullRatio = *maxNullRatio
-	ix.AddPaths(args)
+	ix.AddPaths(paths)
 
 	walkChan := make(chan string)
 	doneChan := make(chan bool)
 
+	masterAbs, err := filepath.Abs(master)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	go func() {
-		seen := make(map[string]bool)
+		// The index and its temporary files must not be indexed.
+		seen := map[string]bool{
+			masterAbs:        true,
+			masterAbs + "~":  true,
+			masterAbs + "~~": true,
+		}
 		for {
 			select {
 			case path := <-walkChan:
 				if !seen[path] {
 					seen[path] = true
-					ix.AddFile(path)
+					if !relative {
+						ix.AddFile(path)
+					} else if name, ok := relativeName(root, path); ok {
+						ix.AddFileAs(path, name)
+					} else {
+						log.Printf("%s: skipped. Outside %s", path, root)
+					}
 				}
 			case <-doneChan:
 				return
