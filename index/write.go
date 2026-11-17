@@ -38,8 +38,8 @@ type IndexWriter struct {
 	LogSkip bool // log information about skipped files
 	Verbose bool // log status using package log
 
-	trigram *sparse.Set // trigrams for the current file
-	buf     [8]byte     // scratch buffer
+	scanner *scanner // scans files added without a ParallelAdder
+	buf     [8]byte  // scratch buffer
 
 	paths []string
 
@@ -53,8 +53,7 @@ type IndexWriter struct {
 	postFile  []*os.File  // flushed post entries
 	postIndex *bufWriter  // temp file holding posting list index
 
-	inbuf []byte     // input buffer
-	main  *bufWriter // main index file
+	main *bufWriter // main index file
 
 	MaxFileLen      int64
 	MaxLineLen      int
@@ -69,13 +68,12 @@ const npost = 64 << 20 / 8 // 64 MB worth of post entries
 // Create returns a new IndexWriter that will write the index to file.
 func Create(file string) *IndexWriter {
 	return &IndexWriter{
-		trigram:             sparse.NewSet(1 << 24),
+		scanner:             newScanner(),
 		nameData:            bufCreate(""),
 		nameIndex:           bufCreate(""),
 		postIndex:           bufCreate(""),
 		main:                bufCreate(file),
 		post:                make([]postEntry, 0, npost),
-		inbuf:               make([]byte, 16384),
 		MaxFileLen:          1 << 30,
 		MaxLineLen:          2000,
 		MaxTextTrigrams:     20000,
@@ -116,34 +114,79 @@ func (ix *IndexWriter) AddFile(name string) {
 // AddFileAs adds the file at path (opened using os.Open) to the index
 // under the given name.  It logs errors using package log.
 func (ix *IndexWriter) AddFileAs(path, name string) {
-	fi, err := os.Stat(path)
-	if err != nil {
-		log.Print(err)
-		return
+	if trigrams, n, ok := ix.scanFile(ix.scanner, path, name); ok {
+		ix.add(name, trigrams, n)
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-	defer f.Close()
-	ix.Add(name, f, fi.Size())
 }
 
 // Add adds the file f to the index under the given name.
 // It logs errors using package log.
 func (ix *IndexWriter) Add(name string, f io.Reader, size int64) {
+	if trigrams, n, ok := ix.scan(ix.scanner, name, f, size); ok {
+		ix.add(name, trigrams, n)
+	}
+}
+
+// add adds the next file to the index, given its trigrams and length.
+func (ix *IndexWriter) add(name string, trigrams []uint32, n int64) {
+	ix.totalBytes += n
+
+	if ix.Verbose {
+		log.Printf("%d %d %s\n", n, len(trigrams), name)
+	}
+
+	fileid := ix.addName(name)
+	for _, trigram := range trigrams {
+		if len(ix.post) >= cap(ix.post) {
+			ix.flushPost()
+		}
+		ix.post = append(ix.post, makePostEntry(trigram, fileid))
+	}
+}
+
+// A scanner holds what one goroutine needs to find the trigrams in files.
+type scanner struct {
+	trigram *sparse.Set
+	inbuf   []byte
+}
+
+func newScanner() *scanner {
+	return &scanner{
+		trigram: sparse.NewSet(1 << 24),
+		inbuf:   make([]byte, 16384),
+	}
+}
+
+// scanFile is scan for the file at path.
+func (ix *IndexWriter) scanFile(s *scanner, path, name string) ([]uint32, int64, bool) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		log.Print(err)
+		return nil, 0, false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		log.Print(err)
+		return nil, 0, false
+	}
+	defer f.Close()
+	return ix.scan(s, name, f, fi.Size())
+}
+
+// scan returns the trigrams in f and its length, or false if f should not
+// be indexed. The trigrams are only valid until s scans another file.
+func (ix *IndexWriter) scan(s *scanner, name string, f io.Reader, size int64) ([]uint32, int64, bool) {
 	if size > ix.MaxFileLen {
 		if ix.LogSkip {
 			log.Printf("%s: too long, ignoring\n", name)
 		}
-		return
+		return nil, 0, false
 	}
-	ix.trigram.Reset()
+	s.trigram.Reset()
 	var (
 		c           = byte(0)
 		i           = 0
-		buf         = ix.inbuf[:0]
+		buf         = s.inbuf[:0]
 		tv          = uint32(0)
 		n           = int64(0)
 		linelen     = 0
@@ -164,10 +207,10 @@ func (ix *IndexWriter) Add(name string, f io.Reader, size int64) {
 						break
 					}
 					log.Printf("%s: %v\n", name, err)
-					return
+					return nil, 0, false
 				}
 				log.Printf("%s: 0-length read\n", name)
-				return
+				return nil, 0, false
 			}
 			buf = buf[:n]
 			i = 0
@@ -183,10 +226,10 @@ func (ix *IndexWriter) Add(name string, f io.Reader, size int64) {
 					if ix.LogSkip {
 						log.Printf("%s: skipped. High invalid UTF-8 ratio. total: %d, invalid: %d, ratio: %f\n", name, size, inv_cnt, float64(inv_cnt)/float64(size))
 					}
-					return
+					return nil, 0, false
 				}
 			} else {
-				ix.trigram.Add(tv)
+				s.trigram.Add(tv)
 			}
 		}
 		if c == 0x00 {
@@ -194,14 +237,14 @@ func (ix *IndexWriter) Add(name string, f io.Reader, size int64) {
 				if ix.LogSkip {
 					log.Printf("%s: skipped. High null byte ratio. total: %d, null: %d, ratio: %f\n", name, size, null_cnt, float64(null_cnt)/float64(size))
 				}
-				return
+				return nil, 0, false
 			}
 		}
 		if linelen++; linelen > ix.MaxLineLen {
 			if ix.LogSkip {
 				log.Printf("%s: skipped. Very long lines (%d)\n", name, linelen)
 			}
-			return
+			return nil, 0, false
 		}
 		if c == '\n' {
 			linelen = 0
@@ -212,28 +255,16 @@ func (ix *IndexWriter) Add(name string, f io.Reader, size int64) {
 			if ix.LogSkip {
 				log.Printf("%s: skipped. High invalid UTF-8 ratio. total: %d invalid: %d ratio: %f\n", name, size, inv_cnt, float64(inv_cnt)/float64(size))
 			}
-			return
+			return nil, 0, false
 		}
 	}
-	if ix.trigram.Len() > ix.MaxTextTrigrams {
+	if s.trigram.Len() > ix.MaxTextTrigrams {
 		if ix.LogSkip {
-			log.Printf("%s: skipped. Too many trigrams (%d > %d)\n", name, ix.trigram.Len(), ix.MaxTextTrigrams)
+			log.Printf("%s: skipped. Too many trigrams (%d > %d)\n", name, s.trigram.Len(), ix.MaxTextTrigrams)
 		}
-		return
+		return nil, 0, false
 	}
-	ix.totalBytes += n
-
-	if ix.Verbose {
-		log.Printf("%d %d %s\n", n, ix.trigram.Len(), name)
-	}
-
-	fileid := ix.addName(name)
-	for _, trigram := range ix.trigram.Dense() {
-		if len(ix.post) >= cap(ix.post) {
-			ix.flushPost()
-		}
-		ix.post = append(ix.post, makePostEntry(trigram, fileid))
-	}
+	return s.trigram.Dense(), n, true
 }
 
 // Flush flushes the index entry to the target file.

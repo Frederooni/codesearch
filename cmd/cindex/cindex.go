@@ -13,6 +13,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"runtime/pprof"
 	"sort"
 	"strings"
@@ -43,6 +44,8 @@ Options:
                relative when cindex updates it.
   -cpuprofile FILE
                write CPU profile to FILE
+  -threads N   read and scan N files at a time (Default: the number of
+               logical CPUs, %v here)
   -logskip     print why a file was skipped from indexing
   -no-follow-symlinks
                do not follow symlinked files and directories
@@ -90,7 +93,7 @@ With no path arguments, cindex -reset removes the index.
 `
 
 func usage() {
-	fmt.Fprintf(os.Stderr, usageMessage, DEFAULT_MAX_FILE_LENGTH, DEFAULT_MAX_LINE_LENGTH, DEFAULT_MAX_TEXT_TRIGRAMS, DEFAULT_MAX_INVALID_UTF8_RATIO, DEFAULT_MAX_NULL_RATIO)
+	fmt.Fprintf(os.Stderr, usageMessage, runtime.NumCPU(), DEFAULT_MAX_FILE_LENGTH, DEFAULT_MAX_LINE_LENGTH, DEFAULT_MAX_TEXT_TRIGRAMS, DEFAULT_MAX_INVALID_UTF8_RATIO, DEFAULT_MAX_NULL_RATIO)
 	os.Exit(2)
 }
 
@@ -99,6 +102,7 @@ var (
 	resetFlag            = flag.Bool("reset", false, "discard existing index")
 	verboseFlag          = flag.Bool("verbose", false, "print extra information")
 	cpuProfile           = flag.String("cpuprofile", "", "write cpu profile to this file")
+	threadsFlag          = flag.Int("threads", runtime.NumCPU(), "read and scan this many files at a time")
 	indexPath            = flag.String("indexpath", "", "specifies index path")
 	relativeFlag         = flag.Bool("relative", false, "store paths relative to the directory that contains the index")
 	logSkipFlag          = flag.Bool("logskip", false, "print why a file was skipped from indexing")
@@ -429,6 +433,7 @@ func main() {
 	ix.MaxInvalidUTF8Ratio = *maxInvalidUTF8Ratio
 	ix.MaxNullRatio = *maxNullRatio
 	ix.AddPaths(paths)
+	adder := ix.Parallel(*threadsFlag)
 
 	walkChan := make(chan string)
 	doneChan := make(chan bool)
@@ -451,9 +456,9 @@ func main() {
 				if !seen[path] {
 					seen[path] = true
 					if !relative {
-						ix.AddFile(path)
+						adder.AddFileAs(path, path)
 					} else if name, ok := relativeName(root, path); ok {
-						ix.AddFileAs(path, name)
+						adder.AddFileAs(path, name)
 					} else {
 						log.Printf("%s: skipped. Outside %s", path, root)
 					}
@@ -468,6 +473,7 @@ func main() {
 		walk(arg, "", walkChan, *logSkipFlag)
 	}
 	doneChan <- true
+	adder.Wait()
 	log.Printf("flush index")
 	ix.Flush()
 
