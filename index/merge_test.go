@@ -103,6 +103,35 @@ func TestMerge(t *testing.T) {
 	check(ix3, "pot", 4, 5, 7)
 }
 
+func TestMergeVersion1(t *testing.T) {
+	f1, _ := ioutil.TempFile("", "index-test")
+	f2, _ := ioutil.TempFile("", "index-test")
+	f3, _ := ioutil.TempFile("", "index-test")
+	defer os.Remove(f1.Name())
+	defer os.Remove(f2.Name())
+	defer os.Remove(f3.Name())
+
+	f1.WriteString(trivialIndex1)
+	f1.Close()
+	buildIndex(t, f2.Name(), []string{"zfile"}, map[string]string{"zfile": "\nabc\n"})
+	Merge(f3.Name(), f1.Name(), f2.Name())
+
+	ix := Open(f3.Name())
+	defer ix.Close()
+	if ix.v1 {
+		t.Errorf("merged index is version 1")
+	}
+	if n := ix.Name(6); n != "zfile" {
+		t.Errorf("Name(6) = %s, want zfile", n)
+	}
+	if l := ix.PostingList(tri('a', 'b', 'c')); !equalList(l, []uint32{0, 3, 6}) {
+		t.Errorf("PostingList(abc) = %v, want [0 3 6]", l)
+	}
+	if l := ix.PostingList(tri('\n', 'a', 'b')); !equalList(l, []uint32{3, 5, 6}) {
+		t.Errorf("PostingList(\\nab) = %v, want [3 5 6]", l)
+	}
+}
+
 func TestMergeRelative(t *testing.T) {
 	tests := []struct {
 		name           string

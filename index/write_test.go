@@ -24,14 +24,7 @@ var trivialFiles = map[string]string{
 	"file5":    "\nxyzw\n",
 }
 
-var trivialIndex = join(
-	// header
-	"csearch index 1\n",
-
-	// list of paths
-	"\x00",
-
-	// list of names
+var trivialNames = join(
 	"afile4\x00",
 	"f0\x00",
 	"file1\x00",
@@ -39,22 +32,9 @@ var trivialIndex = join(
 	"file5\x00",
 	"thefile2\x00",
 	"\x00",
+)
 
-	// list of posting lists
-	"\na\n", fileList(2), // file1
-	"\nab", fileList(3, 5), // file3, thefile2
-	"\nda", fileList(0), // afile4
-	"\nxy", fileList(4), // file5
-	"ab\n", fileList(5), // thefile2
-	"abc", fileList(0, 3), // afile4, file3
-	"bc\n", fileList(0, 3), // afile4, file3
-	"dab", fileList(0), // afile4
-	"xyz", fileList(4), // file5
-	"yzw", fileList(4), // file5
-	"zw\n", fileList(4), // file5
-	"\xff\xff\xff", fileList(),
-
-	// name index
+var trivialNameIndex = join(
 	u32(0),
 	u32(6+1),
 	u32(6+1+2+1),
@@ -62,6 +42,85 @@ var trivialIndex = join(
 	u32(6+1+2+1+5+1+5+1),
 	u32(6+1+2+1+5+1+5+1+5+1),
 	u32(6+1+2+1+5+1+5+1+5+1+8+1),
+)
+
+var trivialIndex = join(
+	// header
+	"csearch index 3\n",
+
+	// list of paths
+	"\x00",
+
+	// list of names
+	trivialNames,
+
+	// list of posting lists
+	"\x21",     // \na\n: file1
+	"\x22\x20", // \nab: file3, thefile2
+	"\x01",     // \nda: afile4
+	"\x23",     // \nxy: file5
+	"\x24",     // ab\n: thefile2
+	"\x01\x21", // abc: afile4, file3
+	"\x01\x21", // bc\n: afile4, file3
+	"\x01",     // dab: afile4
+	"\x23",     // xyz: file5
+	"\x23",     // yzw: file5
+	"\x23",     // zw\n: file5
+
+	// name index
+	trivialNameIndex,
+
+	// posting list index,
+	"\na\n", u32(1), u32(0),
+	"\nab", u32(2), u32(1),
+	"\nda", u32(1), u32(3),
+	"\nxy", u32(1), u32(4),
+	"ab\n", u32(1), u32(5),
+	"abc", u32(2), u32(6),
+	"bc\n", u32(2), u32(8),
+	"dab", u32(1), u32(10),
+	"xyz", u32(1), u32(11),
+	"yzw", u32(1), u32(12),
+	"zw\n", u32(1), u32(13),
+	"\xff\xff\xff", u32(0), u32(14),
+
+	// trailer
+	u32(16),
+	u32(16+1),
+	u32(16+1+38),
+	u32(16+1+38+14),
+	u32(16+1+38+14+28),
+
+	"\ncsearch trail3\n",
+)
+
+// trivialIndex1 is trivialIndex in the version 1 format.
+var trivialIndex1 = join(
+	// header
+	"csearch index 1\n",
+
+	// list of paths
+	"\x00",
+
+	// list of names
+	trivialNames,
+
+	// list of posting lists
+	"\na\n", fileList1(2), // file1
+	"\nab", fileList1(3, 5), // file3, thefile2
+	"\nda", fileList1(0), // afile4
+	"\nxy", fileList1(4), // file5
+	"ab\n", fileList1(5), // thefile2
+	"abc", fileList1(0, 3), // afile4, file3
+	"bc\n", fileList1(0, 3), // afile4, file3
+	"dab", fileList1(0), // afile4
+	"xyz", fileList1(4), // file5
+	"yzw", fileList1(4), // file5
+	"zw\n", fileList1(4), // file5
+	"\xff\xff\xff", fileList1(),
+
+	// name index
+	trivialNameIndex,
 
 	// posting list index,
 	"\na\n", u32(1), u32(0),
@@ -100,7 +159,7 @@ func u32(x uint32) string {
 	return string(buf[:])
 }
 
-func fileList(list ...uint32) string {
+func fileList1(list ...uint32) string {
 	var buf []byte
 
 	last := ^uint32(0)

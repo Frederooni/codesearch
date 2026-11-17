@@ -25,7 +25,7 @@ package index
 // The number of ranges will be at most the combined number of paths.
 // Also during the merge, write the name index to a temporary file as usual.
 //
-// Now merge the posting lists (this is why they begin with the trigram).
+// Now merge the posting lists.
 // During the merge, translate the docid numbers to the new C docid space.
 // Also during the merge, write the posting list index to a temporary file as usual.
 //
@@ -33,7 +33,6 @@ package index
 // Rename C's index onto the new index.
 
 import (
-	"encoding/binary"
 	"os"
 	"strings"
 )
@@ -250,7 +249,7 @@ type postMapReader struct {
 	trigram uint32
 	count   uint32
 	offset  uint32
-	d       []byte
+	p       postDecoder
 	oldid   uint32
 	fileid  uint32
 	i       int
@@ -280,7 +279,7 @@ func (r *postMapReader) load() {
 		r.fileid = ^uint32(0)
 		return
 	}
-	r.d = r.ix.slice(r.ix.postData+r.offset+3, -1)
+	r.p = r.ix.postDecoder(r.offset)
 	r.oldid = ^uint32(0)
 	r.i = 0
 }
@@ -288,13 +287,7 @@ func (r *postMapReader) load() {
 func (r *postMapReader) nextId() bool {
 	for r.count > 0 {
 		r.count--
-		delta64, n := binary.Uvarint(r.d)
-		delta := uint32(delta64)
-		if n <= 0 || delta == 0 {
-			corrupt()
-		}
-		r.d = r.d[n:]
-		r.oldid += delta
+		r.oldid = r.p.next()
 		for r.i < len(r.idmap) && r.idmap[r.i].hi <= r.oldid {
 			r.i++
 		}
@@ -319,7 +312,7 @@ type postDataWriter struct {
 	buf           [10]byte
 	base          uint32
 	count, offset uint32
-	last          uint32
+	enc           postEncoder
 	t             uint32
 }
 
@@ -333,15 +326,11 @@ func (w *postDataWriter) trigram(t uint32) {
 	w.offset = w.out.offset()
 	w.count = 0
 	w.t = t
-	w.last = ^uint32(0)
+	w.enc = postEncoder{out: w.out, last: ^uint32(0)}
 }
 
 func (w *postDataWriter) fileid(id uint32) {
-	if w.count == 0 {
-		w.out.writeTrigram(w.t)
-	}
-	w.out.writeUvarint(id - w.last)
-	w.last = id
+	w.enc.fileid(id)
 	w.count++
 }
 
@@ -349,7 +338,7 @@ func (w *postDataWriter) endTrigram() {
 	if w.count == 0 {
 		return
 	}
-	w.out.writeUvarint(0)
+	w.enc.end()
 	w.postIndexFile.writeTrigram(w.t)
 	w.postIndexFile.writeUint32(w.count)
 	w.postIndexFile.writeUint32(w.offset - w.base)

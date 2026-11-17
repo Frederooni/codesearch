@@ -10,7 +10,7 @@ package index
 //
 // An index stored on disk has the format:
 //
-//	"csearch index 1\n"
+//	"csearch index 3\n"
 //	list of paths
 //	list of names
 //	list of posting lists
@@ -28,18 +28,14 @@ package index
 // empty name ("\x00").
 //
 // The list of posting lists are a sequence of posting lists.
-// Each posting list has the form:
-//
-//	trigram [3]
-//	deltas [v]...
-//
-// The trigram gives the 3 byte trigram that this list describes.  The
-// delta list is a sequence of varint-encoded deltas between file
-// IDs, ending with a zero delta.  For example, the delta list [2,5,1,1,0]
-// encodes the file ID list 1, 6, 7, 8.  The delta list [0] would
-// encode the empty file ID list, but empty posting lists are usually
-// not recorded at all.  The list of posting lists ends with an entry
-// with trigram "\xff\xff\xff" and a delta list consisting a single zero.
+// Each posting list is a sequence of varint-encoded values that give
+// its file IDs in increasing order, starting from -1.  A value v of 31
+// or less stands for the next v file IDs in a row.  A larger value v
+// means the next file ID is v-30 past the previous one.  For example, the
+// values [3,33,1] encode the file ID list 0, 1, 2, 5, 6.  The posting list
+// index entry gives the trigram and the number of file IDs, which is where
+// a list ends.  Empty posting lists are usually not recorded at all.  The
+// list of posting lists ends with an empty list for trigram "\xff\xff\xff".
 //
 // The indexes enable efficient random access to the lists.  The name
 // index is a sequence of 4-byte big-endian values listing the byte
@@ -64,7 +60,12 @@ package index
 //	offset of posting lists [4]
 //	offset of name index [4]
 //	offset of posting list index [4]
-//	"\ncsearch trailr\n"
+//	"\ncsearch trail3\n"
+//
+// Version 1 indexes, which start with "csearch index 1\n" and end with
+// "\ncsearch trailr\n", can still be read.  Their posting lists begin
+// with the trigram, give each file ID as its difference from the previous
+// one (starting from -1), and end with a zero.
 
 import (
 	"bytes"
@@ -77,13 +78,19 @@ import (
 )
 
 const (
-	magic        = "csearch index 1\n"
-	trailerMagic = "\ncsearch trailr\n"
+	// Version 3, because waddyano's fork already uses version 2 for another format.
+	magic         = "csearch index 3\n"
+	trailerMagic  = "\ncsearch trail3\n"
+	trailerMagic1 = "\ncsearch trailr\n"
+
+	// The largest run of consecutive file IDs that one posting list value holds.
+	maxRun = 31
 )
 
 // An Index implements read-only access to a trigram index.
 type Index struct {
 	Verbose   bool
+	v1        bool
 	data      mmapData
 	pathData  uint32
 	nameData  uint32
@@ -98,11 +105,15 @@ const postEntrySize = 3 + 4 + 4
 
 func Open(file string) *Index {
 	mm := mmap(file)
-	if len(mm.d) < 4*4+len(trailerMagic) || string(mm.d[len(mm.d)-len(trailerMagic):]) != trailerMagic {
+	if len(mm.d) < 4*4+len(trailerMagic) {
+		corrupt()
+	}
+	trailer := string(mm.d[len(mm.d)-len(trailerMagic):])
+	if trailer != trailerMagic && trailer != trailerMagic1 {
 		corrupt()
 	}
 	n := uint32(len(mm.d) - len(trailerMagic) - 5*4)
-	ix := &Index{data: mm}
+	ix := &Index{data: mm, v1: trailer == trailerMagic1}
 	ix.pathData = ix.uint32(n)
 	ix.nameData = ix.uint32(n + 4)
 	ix.postData = ix.uint32(n + 8)
@@ -223,12 +234,61 @@ func (ix *Index) findList(trigram uint32) (count int, offset uint32) {
 	return
 }
 
+// A postDecoder decodes the file IDs of a posting list.
+// Its caller stops after the number of file IDs in the list's index entry.
+type postDecoder struct {
+	d      []byte
+	v1     bool
+	run    uint32
+	fileid uint32
+}
+
+// postDecoder returns a decoder for the posting list at offset.
+func (ix *Index) postDecoder(offset uint32) postDecoder {
+	if ix.v1 {
+		return postDecoder{d: ix.slice(ix.postData+offset+3, -1), v1: true, fileid: ^uint32(0)}
+	}
+	return postDecoder{d: ix.slice(ix.postData+offset, -1), fileid: ^uint32(0)}
+}
+
+// next returns the next file ID.
+func (p *postDecoder) next() uint32 {
+	if p.run > 0 {
+		p.run--
+		p.fileid++
+		return p.fileid
+	}
+	v64, n := binary.Uvarint(p.d)
+	v := uint32(v64)
+	if n <= 0 || v == 0 {
+		corrupt()
+	}
+	p.d = p.d[n:]
+	switch {
+	case p.v1:
+		p.fileid += v
+	case v <= maxRun:
+		p.run = v - 1
+		p.fileid++
+	default:
+		p.fileid += v - (maxRun - 1)
+	}
+	return p.fileid
+}
+
+// end checks that the list held no more file IDs than its index entry says.
+func (p *postDecoder) end() {
+	if p.run != 0 || p.v1 && (len(p.d) == 0 || p.d[0] != 0) {
+		corrupt()
+	}
+}
+
 type postReader struct {
 	ix       *Index
 	count    int
 	offset   uint32
 	fileid   uint32
-	d        []byte
+	p        postDecoder
 	restrict []uint32
 }
 
@@ -241,7 +301,7 @@ func (r *postReader) init(ix *Index, trigram uint32, restrict []uint32) {
 	r.count = count
 	r.offset = offset
 	r.fileid = ^uint32(0)
-	r.d = ix.slice(ix.postData+offset+3, -1)
+	r.p = ix.postDecoder(offset)
 	r.restrict = restrict
 }
 
@@ -252,13 +312,7 @@ func (r *postReader) max() int {
 func (r *postReader) next() bool {
 	for r.count > 0 {
 		r.count--
-		delta64, n := binary.Uvarint(r.d)
-		delta := uint32(delta64)
-		if n <= 0 || delta == 0 {
-			corrupt()
-		}
-		r.d = r.d[n:]
-		r.fileid += delta
+		r.fileid = r.p.next()
 		if r.restrict != nil {
 			i := 0
 			for i < len(r.restrict) && r.restrict[i] < r.fileid {
@@ -271,9 +325,8 @@ func (r *postReader) next() bool {
 		}
 		return true
 	}
-	// list should end with terminating 0 delta
-	if r.d != nil && (len(r.d) == 0 || r.d[0] != 0) {
-		corrupt()
+	if r.ix != nil {
+		r.p.end()
 	}
 	r.fileid = ^uint32(0)
 	return false

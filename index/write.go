@@ -347,15 +347,13 @@ func (ix *IndexWriter) mergePost(out *bufWriter) {
 		ix.buf[2] = byte(trigram)
 
 		// posting list
-		fileid := ^uint32(0)
 		nfile := uint32(0)
-		out.write(ix.buf[:3])
+		enc := postEncoder{out: out, last: ^uint32(0)}
 		for ; e.trigram() == trigram && trigram != 1<<24-1; e = h.next() {
-			out.writeUvarint(e.fileid() - fileid)
-			fileid = e.fileid()
+			enc.fileid(e.fileid())
 			nfile++
 		}
-		out.writeUvarint(0)
+		enc.end()
 
 		// index entry
 		ix.postIndex.write(ix.buf[:3])
@@ -365,6 +363,34 @@ func (ix *IndexWriter) mergePost(out *bufWriter) {
 		if trigram == 1<<24-1 {
 			break
 		}
+	}
+}
+
+// A postEncoder writes the file IDs of a posting list in increasing order.
+type postEncoder struct {
+	out  *bufWriter
+	last uint32
+	run  uint32
+}
+
+func (e *postEncoder) fileid(id uint32) {
+	if id-e.last == 1 {
+		e.run++
+		if e.run == maxRun {
+			e.end()
+		}
+	} else {
+		e.end()
+		e.out.writeUvarint(id - e.last + (maxRun - 1))
+	}
+	e.last = id
+}
+
+// end writes any run of consecutive file IDs not yet written.
+func (e *postEncoder) end() {
+	if e.run > 0 {
+		e.out.writeUvarint(e.run)
+		e.run = 0
 	}
 }
 
