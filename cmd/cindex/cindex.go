@@ -60,7 +60,10 @@ Options:
   -max-null-ratio RATIO
                skip indexing a file if it has more than this ratio of null bytes (Default: %v)
   -exclude FILE
-               path to file containing a list of file patterns to exclude from indexing
+               path to file containing a list of file patterns to exclude from indexing.
+               A pattern that starts with / is matched against the path below each
+               indexed path instead of against the file or directory name.
+  -gitignore   skip paths matched by .gitignore files found while indexing
   -filelist FILE
                path to file containing a list of file paths to index
 
@@ -90,6 +93,9 @@ information about other paths that might already be indexed
 (the ones printed by cindex -list).  The -reset flag causes cindex to
 delete the existing index before indexing the new paths.
 With no path arguments, cindex -reset removes the index.
+
+cindex skips paths matched by any .csearch.ignore file it finds while
+indexing. These files use .gitignore syntax.
 `
 
 func usage() {
@@ -108,6 +114,7 @@ var (
 	logSkipFlag          = flag.Bool("logskip", false, "print why a file was skipped from indexing")
 	noFollowSymlinksFlag = flag.Bool("no-follow-symlinks", false, "do not follow symlinked files and directories")
 	exclude              = flag.String("exclude", "", "path to file containing a list of file patterns to exclude from indexing")
+	gitignoreFlag        = flag.Bool("gitignore", false, "skip paths matched by .gitignore files")
 	fileList             = flag.String("filelist", "", "path to file containing a list of file paths to index")
 	// Tuning variables for detecting text files.
 	// A file is assumed not to be text files (and thus not indexed) if
@@ -127,19 +134,15 @@ var (
 	}
 )
 
-func walk(arg string, symlinkFrom string, out chan string, logskip bool) {
+func walk(arg string, symlinkFrom string, out chan string, logskip bool, s *index.Ignorer) {
 	filepath.Walk(arg, func(path string, info os.FileInfo, err error) error {
+		logical := path
+		if symlinkFrom != "" {
+			logical = symlinkFrom + path[len(arg):]
+		}
+		s.Leave(logical)
 		if basedir, elem := filepath.Split(path); elem != "" {
-			exclude := false
-			for _, pattern := range excludePatterns {
-				exclude, err = filepath.Match(pattern, elem)
-				if err != nil {
-					log.Fatal(err)
-				}
-				if exclude {
-					break
-				}
-			}
+			exclude := s.Ignored(logical, elem, info != nil && info.IsDir())
 
 			// Skip various temporary or "hidden" files or directories.
 			if info != nil && info.IsDir() {
@@ -187,7 +190,7 @@ func walk(arg string, symlinkFrom string, out chan string, logskip bool) {
 							log.Printf("%s: skipped. Symlink could not be resolved", path)
 						}
 					} else {
-						walk(p, symlinkAs, out, logskip)
+						walk(p, symlinkAs, out, logskip, s)
 					}
 					return nil
 				}
@@ -200,6 +203,9 @@ func walk(arg string, symlinkFrom string, out chan string, logskip bool) {
 				log.Printf("%s: skipped. Error: %s", path, err)
 			}
 			return nil
+		}
+		if info != nil && info.IsDir() {
+			s.Enter(path, logical)
 		}
 		if info != nil {
 			if info.Mode()&os.ModeType == 0 {
@@ -324,6 +330,10 @@ func main() {
 		for i, pattern := range excludePatterns {
 			excludePatterns[i] = strings.TrimSpace(pattern)
 		}
+	}
+	excludeRules, err := index.ParseExclude(excludePatterns)
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	if *fileList != "" {
@@ -470,7 +480,7 @@ func main() {
 	}()
 	for _, arg := range args {
 		log.Printf("index %s", arg)
-		walk(arg, "", walkChan, *logSkipFlag)
+		walk(arg, "", walkChan, *logSkipFlag, index.NewIgnorer(arg, excludeRules, *gitignoreFlag))
 	}
 	doneChan <- true
 	adder.Wait()
